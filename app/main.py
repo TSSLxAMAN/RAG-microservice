@@ -6,11 +6,11 @@ from dotenv import load_dotenv
 import logging
 
 from app.models import (
-    TrainRequest, TrainResponse,
+    TrainResponse,
     QuestionRequest, QuestionResponse,
-    ScoreRequest, ScoreResponse,
+    ScoreResponse,
     GenerateQuestionsRequest, GenerateQuestionsResponse,
-    Question, DeleteCollectionRequest, DeleteCollectionResponse
+    Question, DeleteCollectionResponse
 )
 
 from app.utils.vector_store import VectorStore
