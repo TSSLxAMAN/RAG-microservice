@@ -30,6 +30,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Data & Models
+/data
 data/
 *.db
 chroma.sqlite3
