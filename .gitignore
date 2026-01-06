@@ -1,3 +1,6 @@
 /.dockerignore
 /.env
 /venv
+/data
+chroma.sqlite3
+__pycache__
