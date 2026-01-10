@@ -201,7 +201,7 @@ class RAGService:
             })
         
         # Filter out very short or empty answers
-        qa_pairs = [qa for qa in qa_pairs if len(qa['answer'].split()) > 10]
+        qa_pairs = [qa for qa in qa_pairs if len(qa['answer'].split()) > 6]
         
         logger.info(f"Parsed {len(qa_pairs)} question-answer pairs")
         return qa_pairs
@@ -211,7 +211,7 @@ class RAGService:
         """Score a single answer intelligently"""
         
         # 1. Content Relevance Score (40%)
-        content_score = self._score_content_relevance(reference_collection, answer)
+        content_score = self._score_content_relevance(reference_collection, question, answer)
         
         # 2. Answer Completeness Score (30%)
         completeness_score = self._score_answer_completeness(answer, question)
@@ -225,6 +225,7 @@ class RAGService:
             completeness_score * 0.30 +
             alignment_score * 0.30
         ) * 100
+
         
         # Generate specific feedback for this answer
         feedback = self._generate_answer_feedback(
@@ -242,7 +243,7 @@ class RAGService:
         }
 
 
-    def _score_content_relevance(self, reference_collection: str, answer: str) -> float:
+    def _score_content_relevance(self, reference_collection: str, question: str, answer: str) -> float:
         """Check how well the answer matches reference material (0-1)"""
         
         try:
@@ -257,16 +258,22 @@ class RAGService:
             sentence_scores = []
             
             for sentence in sentences[:5]:  # Check up to 5 sentences
+                query = f"{question}. {sentence}. {answer[:150]}"
                 results = self.vector_store.search(
                     collection_name=reference_collection,
-                    query=sentence,
-                    n_results=1
+                    query=query,
+                    n_results=3
                 )
+
                 
                 if results['distances'] and results['distances'][0]:
-                    distance = results['distances'][0][0]
-                    similarity = max(0, 1 - distance)
-                    sentence_scores.append(similarity)
+                    distances = results['distances'][0]
+                    similarities = [
+                        max(0, 1 - (d * 0.7))
+                        for d in distances
+                    ]
+                    sentence_scores.append(sum(similarities) / len(similarities))
+
             
             # Return average similarity
             return sum(sentence_scores) / len(sentence_scores) if sentence_scores else 0.0
@@ -354,7 +361,7 @@ class RAGService:
             results = self.vector_store.search(
                 collection_name=reference_collection,
                 query=combined,
-                n_results=1
+                n_results=2
             )
             
             if results['distances'] and results['distances'][0]:
