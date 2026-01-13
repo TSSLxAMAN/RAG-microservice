@@ -159,51 +159,65 @@ class RAGService:
 
 
     def _parse_assignment_qa(self, text: str) -> List[Dict]:
-        """Parse assignment text into question-answer pairs"""
-        
+        """Robust PDF Q&A parser"""
+
+        # Normalize PDF garbage
+        text = text.replace('\f', '\n')
+        text = re.sub(r'\n{2,}', '\n', text)
+
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+
         qa_pairs = []
-        
-        # Pattern to match questions (Q1, Question 1, 1., etc.)
-        question_pattern = r'(?:Q(?:uestion)?\s*\d+|^\d+[\.\)])\s*[:\-]?\s*(.+?)(?=(?:Q(?:uestion)?\s*\d+|^\d+[\.\)]|$))'
-        
-        # Try to find structured Q&A format
-        lines = text.split('\n')
-        current_question = None
-        current_answer = []
-        
+        question_lines = []
+        answer_lines = []
+        in_question = False
+
+        question_start = re.compile(r'^(?:Q(?:uestion)?\s*\d+|\d+[\.\)])\s*')
+
         for line in lines:
-            line = line.strip()
-            
-            # Check if line starts a question
-            if re.match(r'^(?:Q(?:uestion)?\s*\d+|^\d+[\.\)])', line):
-                # Save previous Q&A if exists
-                if current_question and current_answer:
+            # New question detected
+            if question_start.match(line):
+                # Flush previous Q&A (even if answer is short)
+                if question_lines:
                     qa_pairs.append({
-                        'question': current_question,
-                        'answer': ' '.join(current_answer).strip()
+                        "question": " ".join(question_lines).strip(),
+                        "answer": " ".join(answer_lines).strip()
                     })
-                
-                # Start new question
-                current_question = re.sub(r'^(?:Q(?:uestion)?\s*\d+|^\d+[\.\)])\s*[:\-]?\s*', '', line)
-                current_answer = []
-            
-            elif current_question and line:
-                # This is part of the answer
-                # Skip if it looks like another question marker
-                if not re.match(r'^(?:Q(?:uestion)?\s*\d+|^\d+[\.\)])', line):
-                    current_answer.append(line)
-        
-        # Add last Q&A
-        if current_question and current_answer:
+
+                question_lines = []
+                answer_lines = []
+                in_question = True
+
+                clean = question_start.sub('', line).strip()
+                question_lines.append(clean)
+                continue
+
+            # Still collecting question (wrapped lines)
+            if in_question:
+                # Heuristic: answers usually start with declarative sentences
+                if re.match(r'^[A-Z].{20,}$', line):
+                    in_question = False
+                    answer_lines.append(line)
+                else:
+                    question_lines.append(line)
+                continue
+
+            # Answer content
+            answer_lines.append(line)
+
+        # 🔥 CRITICAL FIX: always flush last block
+        if question_lines:
             qa_pairs.append({
-                'question': current_question,
-                'answer': ' '.join(current_answer).strip()
+                "question": " ".join(question_lines).strip(),
+                "answer": " ".join(answer_lines).strip()
             })
-        
-        # Filter out very short or empty answers
-        qa_pairs = [qa for qa in qa_pairs if len(qa['answer'].split()) > 6]
-        
-        logger.info(f"Parsed {len(qa_pairs)} question-answer pairs")
+
+        # Gentle cleanup, not execution
+        qa_pairs = [
+            qa for qa in qa_pairs
+            if qa["question"] and len(qa["answer"].split()) >= 5
+        ]
+
         return qa_pairs
 
 
