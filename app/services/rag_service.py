@@ -1,7 +1,8 @@
 import re
-import os
+import json
 import logging
 import random
+import requests
 from typing import List, Dict, Tuple
 from app.utils.vector_store import VectorStore
 from app.services.pdf_processor import PDFProcessor
@@ -103,120 +104,183 @@ class RAGService:
         
         return answer
     
-    def score_assignment(self, reference_collection: str, assignment_pdf_path: str) -> Tuple[bool, float, str, Dict]:
-        """Smart scoring system for assignments with detailed analysis"""
+    def score_assignment(self, reference_collection: str, assignment_pdf_path: str) -> Tuple[bool, float, int]:
+        """
+        Scores assignment using Llama 3.2.
+        Returns: (Success, Average Score, Question Count)
+        """
         try:
-            # Check if reference collection exists
-            if not self.vector_store.collection_exists(reference_collection):
-                return False, 0.0, f"Reference collection '{reference_collection}' not found.", {}
-            
-            # Extract text from assignment PDF
-            logger.info(f"Scoring assignment: {assignment_pdf_path}")
-            assignment_text = self.pdf_processor.extract_text_from_pdf(assignment_pdf_path)
-            
-            if not assignment_text.strip():
-                return False, 0.0, "Failed to extract text from assignment PDF", {}
-            
-            # Parse the assignment into Q&A pairs
-            qa_pairs = self._parse_assignment_qa(assignment_text)
-            
+            # 1. Extract Text & Parse Q/A
+            text = self.pdf_processor.extract_text_from_pdf(assignment_pdf_path)
+            print(text)
+            qa_pairs = self._parse_assignment_qa(text)
+            print(qa_pairs)
             if not qa_pairs:
-                # Fallback to chunk-based scoring if no Q&A structure found
-                return self._score_by_chunks(reference_collection, assignment_text)
-            
-            # Score each answer intelligently
-            detailed_scores = []
+                logger.warning("No Q&A format detected, falling back to simple text scoring")
+                # Fallback logic if needed, or return 0
+                return False, 0.0, 0
+
             total_score = 0
             
-            for qa in qa_pairs:
-                answer_score = self._score_answer(
-                    reference_collection=reference_collection,
-                    question=qa['question'],
-                    answer=qa['answer']
+            # 2. Score each Question individually
+            for item in qa_pairs:
+                question = item['question']
+                student_answer = item['answer']
+                
+                # A. Retrieve the "Correct Answer" context from DB
+                # We use the QUESTION to find the relevant part of the textbook
+                results = self.vector_store.search(
+                    collection_name=reference_collection,
+                    query=question, 
+                    n_results=1 # Get the top matching paragraph
                 )
-                detailed_scores.append(answer_score)
-                total_score += answer_score['score']
+                
+                if not results['documents']:
+                    continue
+                    
+                reference_context = results['documents'][0][0]
+                
+                # B. Ask Llama 3.2 to Grade it
+                score = self._ask_llm_to_grade(question, student_answer, reference_context)
+                total_score += score
+
+            # 3. Calculate Average
+            final_average = total_score / len(qa_pairs)
+            return True, round(final_average, 2), len(qa_pairs)
+
+        except Exception as e:
+            logger.error(f"Scoring Error: {str(e)}")
+            return False, 0.0, 0
+
+    def _ask_llm_to_grade(self, question: str, answer: str, context: str) -> int:
+        """Send prompt to Local LLM to get a 0-100 score"""
+        prompt = f"""
+        You are a strict teacher grading an exam.
+        
+        Reference Material: "{context}"
+        
+        Exam Question: "{question}"
+        Student Answer: "{answer}"
+        
+        Task: Grade the student's answer based ONLY on the Reference Material.
+        If the answer is correct according to the reference, give a high score.
+        If it contradicts the reference or is irrelevant, give a low score.
+        
+        OUTPUT FORMAT: Return ONLY a single integer from 0 to 100. Do not write any text.
+        """
+        
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3.2",
+                    "prompt": prompt,
+                    "stream": False
+                }
+            )
             
-            # Calculate average score
-            avg_score = (total_score / len(detailed_scores)) if detailed_scores else 0
+            if response.status_code == 200:
+                result_text = response.json()['response'].strip()
+                # Extract number from response (in case LLM is chatty)
+                import re
+                match = re.search(r'\d+', result_text)
+                if match:
+                    return int(match.group())
             
-            # Generate comprehensive feedback
-            feedback = self._generate_detailed_feedback(avg_score, detailed_scores)
-            
-            # Prepare details
-            details = {
-                "total_questions": len(qa_pairs),
-                "average_score": round(avg_score, 2),
-                "detailed_scores": detailed_scores,
-                "scoring_breakdown": self._get_scoring_breakdown(detailed_scores)
-            }
-            
-            return True, round(avg_score, 2), feedback, details
+            return 0 # Default to 0 on failure
             
         except Exception as e:
-            logger.error(f"Error in score_assignment: {str(e)}")
-            return False, 0.0, f"Error: {str(e)}", {}
+            logger.error(f"LLM Error: {e}")
+            return 0
 
 
     def _parse_assignment_qa(self, text: str) -> List[Dict]:
-        """Robust PDF Q&A parser"""
-
+        """
+        Robust PDF Q&A parser with Fallback.
+        Strategy 1: Look for numbered questions (e.g., "1. What is...")
+        Strategy 2 (Fallback): If no numbers found, treat paragraphs as Q&A pairs.
+        """
+        
+        # --- CLEANUP PHASE ---
         # Normalize PDF garbage
         text = text.replace('\f', '\n')
-        text = re.sub(r'\n{2,}', '\n', text)
-
+        text = re.sub(r'\n{2,}', '\n\n', text) # Normalize paragraph breaks
         lines = [l.strip() for l in text.split('\n') if l.strip()]
 
         qa_pairs = []
+        
+        # --- STRATEGY 1: STRICT NUMBERED PARSING ---
         question_lines = []
         answer_lines = []
         in_question = False
-
-        question_start = re.compile(r'^(?:Q(?:uestion)?\s*\d+|\d+[\.\)])\s*')
+        
+        # Regex for "1.", "Q1", "1)", "(1)"
+        question_start = re.compile(r'^(?:Q(?:uestion)?\s*\d+|\(?\d+[\.\)])\s*')
 
         for line in lines:
             # New question detected
             if question_start.match(line):
-                # Flush previous Q&A (even if answer is short)
+                # Flush previous
                 if question_lines:
                     qa_pairs.append({
                         "question": " ".join(question_lines).strip(),
                         "answer": " ".join(answer_lines).strip()
                     })
-
+                
                 question_lines = []
                 answer_lines = []
                 in_question = True
-
+                
+                # Remove the number marker (e.g. "1. ") so we just get text
                 clean = question_start.sub('', line).strip()
                 question_lines.append(clean)
                 continue
 
-            # Still collecting question (wrapped lines)
             if in_question:
-                # Heuristic: answers usually start with declarative sentences
-                if re.match(r'^[A-Z].{20,}$', line):
-                    in_question = False
-                    answer_lines.append(line)
-                else:
+                # Simple heuristic: Answers usually start after the question line
+                # If the line looks like a sentence start, assume it's part of answer
+                if len(answer_lines) == 0 and not line.endswith('?'):
+                    in_question = False # Switch to answer mode
+                    
+                if in_question:
                     question_lines.append(line)
-                continue
+                else:
+                    answer_lines.append(line)
+            else:
+                # If we haven't found a question number yet, ignore or add to previous
+                if answer_lines:
+                    answer_lines.append(line)
 
-            # Answer content
-            answer_lines.append(line)
-
-        # 🔥 CRITICAL FIX: always flush last block
+        # Flush the last block
         if question_lines:
             qa_pairs.append({
                 "question": " ".join(question_lines).strip(),
                 "answer": " ".join(answer_lines).strip()
             })
 
-        # Gentle cleanup, not execution
-        qa_pairs = [
-            qa for qa in qa_pairs
-            if qa["question"] and len(qa["answer"].split()) >= 5
-        ]
+        # --- STRATEGY 2: FALLBACK (PARAGRAPH MODE) ---
+        # If Strategy 1 failed to find ANY questions, we use this.
+        if not qa_pairs:
+            logger.warning("Regex parsing failed. Switching to Paragraph Fallback mode.")
+            
+            # Split text by double newlines (paragraphs)
+            paragraphs = text.split('\n\n')
+            
+            for p in paragraphs:
+                p = p.strip()
+                if len(p) < 30: continue # Skip tiny garbage lines
+                
+                # Heuristic: Use the first sentence as the "Question" (Topic)
+                # and the whole paragraph as the "Answer".
+                # This allows the Vector DB to find the right context.
+                sentences = re.split(r'(?<=[.!?])\s+', p)
+                if sentences:
+                    topic_query = sentences[0]
+                    
+                    qa_pairs.append({
+                        "question": topic_query,  # We use this to search the DB
+                        "answer": p               # We grade the whole paragraph
+                    })
 
         return qa_pairs
 
@@ -537,151 +601,71 @@ class RAGService:
             return "Poor. The assignment shows minimal alignment with the reference material."
         
     def generate_questions(
-        self, 
-        collection_name: str, 
-        num_questions: int = 5, 
-        difficulty: str = "moderate"
-    ) -> Tuple[bool, str, List[dict]]:
-        """Generate meaningful, topic-focused questions"""
+    self, 
+    collection_name: str, 
+    num_questions: int = 5, 
+    difficulty: str = "moderate"
+) -> Tuple[bool, str, List[dict]]:
+        """Generate questions using a Local LLM (Ollama)"""
         try:
-            if not self.vector_store.collection_exists(collection_name):
-                return False, f"Collection '{collection_name}' not found.", []
-            
+            # 1. Retrieve Documents (Randomly select a few chunks from the DB)
             collection = self.vector_store.client.get_collection(name=collection_name)
             all_docs = collection.get()
-            
-            if not all_docs['documents']:
-                return False, "No documents found in collection", []
-            
             documents = all_docs['documents']
+
+            if not documents:
+                return False, "No documents found", []
+
+            # Pick random distinct contexts to ensure variety
+            selected_docs = random.sample(documents, min(num_questions, len(documents)))
             
-            # Extract key topics from all documents
-            key_topics = self._extract_key_topics(documents, num_questions)
-            
-            # Generate questions for each topic
-            questions = []
-            for idx, (topic, content) in enumerate(key_topics):
-                question_data = self._generate_topic_question(
-                    topic=topic,
-                    content=content,
-                    question_num=idx + 1,
-                    difficulty=difficulty
+            generated_questions = []
+
+            # 2. Iterate and Generate using LLM
+            for i, doc_context in enumerate(selected_docs):
+                # Construct the Prompt
+                prompt = f"""
+                Context: "{doc_context}"
+                
+                Task: Create 1 distinct {difficulty} level question and its answer based STRICTLY on the text above.
+                
+                Format your response as a JSON object with keys: "question", "answer", "topic".
+                """
+                
+                # Call Local LLM (Ollama Example)
+                # Ensure Ollama is running on port 11434
+                response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "llama3.2", # Or "mistral", "llama3"
+                        "prompt": prompt,
+                        "stream": False,
+                        "format": "json" 
+                    }
                 )
-                questions.append(question_data)
-            
-            return True, f"Successfully generated {len(questions)} questions", questions
-            
-        except Exception as e:
-            logger.error(f"Error in generate_questions: {str(e)}")
-            return False, f"Error: {str(e)}", []
-
-
-    def _extract_key_topics(self, documents: List[str], num_topics: int) -> List[tuple]:
-        """Extract key topics with their content"""
-        
-        topics = []
-        
-        for doc in documents:
-            # Clean document
-            doc = doc.strip()
-            doc = re.sub(r'\s+', ' ', doc)
-            
-            # Split into sentences
-            sentences = re.split(r'[.!?]+', doc)
-            sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
-            
-            for sentence in sentences:
-                # Look for topic indicators
-                topic_patterns = [
-                    r'^([A-Z][a-zA-Z\s]+(?:Learning|Algorithm|Model|Network|Tree|Regression|Classification))',
-                    r'([A-Z][a-zA-Z\s]+)\s+(?:is|are|refers to|means|involves)',
-                    r'^(\d+\.\s*)?([A-Z][a-zA-Z\s]+)',
-                ]
                 
-                for pattern in topic_patterns:
-                    match = re.search(pattern, sentence)
-                    if match:
-                        topic = match.group(1) if len(match.groups()) == 1 else match.group(2)
-                        topic = topic.strip().strip('0123456789. ')
+                if response.status_code == 200:
+                    result = response.json()
+                    try:
+                        # Parse the JSON string from the LLM
+                        llm_data = json.loads(result['response'])
                         
-                        if len(topic.split()) >= 2:  # At least 2 words
-                            # Get surrounding context
-                            start_idx = max(0, sentences.index(sentence) - 1)
-                            end_idx = min(len(sentences), sentences.index(sentence) + 2)
-                            context = ' '.join(sentences[start_idx:end_idx])
-                            
-                            topics.append((topic, context))
-                            break
-        
-        # Remove duplicates and select diverse topics
-        unique_topics = []
-        seen = set()
-        
-        for topic, content in topics:
-            topic_lower = topic.lower()
-            if topic_lower not in seen and len(topic.split()) <= 6:
-                unique_topics.append((topic, content))
-                seen.add(topic_lower)
-                
-                if len(unique_topics) >= num_topics:
-                    break
-        
-        # If we don't have enough, use random substantial chunks
-        while len(unique_topics) < num_topics and documents:
-            doc = random.choice(documents)
-            if len(doc) > 100:
-                words = doc.split()[:8]
-                topic = ' '.join(words)
-                unique_topics.append((topic, doc[:400]))
-        
-        return unique_topics[:num_topics]
+                        generated_questions.append({
+                            "question_number": i + 1,
+                            "question": llm_data.get("question"),
+                            "difficulty": difficulty,
+                            "topic": llm_data.get("topic", "General"),
+                            "expected_answer_hint": llm_data.get("answer")
+                        })
+                    except json.JSONDecodeError:
+                        continue # Skip if LLM hallucinated bad JSON
 
+            return True, f"Generated {len(generated_questions)} questions", generated_questions
 
-    def _generate_topic_question(self, topic: str, content: str, question_num: int, difficulty: str) -> dict:
-        """Generate a question for a specific topic"""
-        
-        if difficulty == "easy":
-            templates = [
-                f"What is {topic}?",
-                f"Define {topic}.",
-                f"Explain {topic} in simple terms.",
-                f"List the main features of {topic}.",
-                f"Describe what you understand by {topic}.",
-            ]
-            
-        elif difficulty == "moderate":
-            templates = [
-                f"Explain how {topic} works with examples.",
-                f"What is the significance of {topic} in machine learning?",
-                f"Discuss the key characteristics of {topic}.",
-                f"How is {topic} applied in real-world scenarios?",
-                f"Compare {topic} with related concepts.",
-                f"What are the advantages of using {topic}?",
-            ]
-            
-        else:  # hard
-            templates = [
-                f"Critically analyze {topic}. What are its strengths and weaknesses?",
-                f"How would you implement {topic} to solve a specific problem? Provide a detailed approach.",
-                f"Evaluate the effectiveness of {topic} compared to alternative methods.",
-                f"Discuss the challenges in implementing {topic} and propose solutions.",
-                f"Design a system using {topic}. Justify your design choices.",
-            ]
-        
-        question = random.choice(templates)
-        
-        # Clean answer hint
-        answer_hint = content[:250] + "..." if len(content) > 250 else content
-        answer_hint = re.sub(r'\s+', ' ', answer_hint).strip()
-        
-        return {
-            "question_number": question_num,
-            "question": question,
-            "difficulty": difficulty,
-            "topic": topic,
-            "expected_answer_hint": answer_hint
-        }
-    
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            return False, str(e), []
+
     def delete_collection(self, collection_name: str) -> Tuple[bool, str]:
         """Delete a collection from the vector database"""
         try:

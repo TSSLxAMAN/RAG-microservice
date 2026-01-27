@@ -33,9 +33,8 @@ class ScoreRequest(BaseModel):
 
 class ScoreResponse(BaseModel):
     success: bool
-    score: float
-    feedback: str
-    details: dict
+    score: float  # Just the number (0-100)
+    total_questions: int
 
 class DifficultyLevel(str, Enum):
     easy = "easy"

@@ -164,26 +164,27 @@ async def score_endpoint(
         logger.info(f"Saved assignment to: {assignment_path}")
         
         # Score the assignment
-        success, score, feedback, details = rag_service.score_assignment(
+        success, score, total_questions = rag_service.score_assignment(
             reference_collection=collection_name,
             assignment_pdf_path=assignment_path
         )
         
         if not success:
-            raise HTTPException(status_code=404, detail=feedback)
+            return ScoreResponse(
+                    success=False,
+                    score=0.0,
+                    total_questions=0
+                )
         
         return ScoreResponse(
             success=True,
             score=score,
-            feedback=feedback,
-            details=details
+            total_questions=total_questions
         )
         
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        logger.error(f"Error in score endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/collections")
