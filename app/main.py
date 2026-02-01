@@ -164,7 +164,7 @@ async def score_endpoint(
         logger.info(f"Saved assignment to: {assignment_path}")
         
         # Score the assignment
-        success, score, total_questions = rag_service.score_assignment(
+        success, score, total_questions, breakdown = rag_service.score_assignment(
             reference_collection=collection_name,
             assignment_pdf_path=assignment_path
         )
@@ -173,13 +173,15 @@ async def score_endpoint(
             return ScoreResponse(
                     success=False,
                     score=0.0,
-                    total_questions=0
+                    total_questions=0,
+                    breakdown=[]
                 )
         
         return ScoreResponse(
             success=True,
             score=score,
-            total_questions=total_questions
+            total_questions=total_questions,
+            breakdown=breakdown
         )
         
     except Exception as e:

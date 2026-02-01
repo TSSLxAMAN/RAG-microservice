@@ -30,11 +30,16 @@ class QuestionResponse(BaseModel):
 class ScoreRequest(BaseModel):
     collection_name: str  # The trained reference model
     
-
+class QuestionGrade(BaseModel):
+    question_number: int
+    score: int
+    feedback: Optional[str] = None
+    
 class ScoreResponse(BaseModel):
     success: bool
     score: float  # Just the number (0-100)
     total_questions: int
+    breakdown: List[QuestionGrade]
 
 class DifficultyLevel(str, Enum):
     easy = "easy"

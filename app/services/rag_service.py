@@ -22,6 +22,8 @@ class RAGService:
             # Extract text from PDF
             logger.info(f"Processing PDF: {pdf_path}")
             text = self.pdf_processor.extract_text_from_pdf(pdf_path)
+
+            print(text)
             
             if not text.strip():
                 return False, "Failed to extract text from PDF", 0
@@ -104,69 +106,143 @@ class RAGService:
         
         return answer
     
-    def score_assignment(self, reference_collection: str, assignment_pdf_path: str) -> Tuple[bool, float, int]:
-        """
-        Scores assignment using Llama 3.2.
-        Returns: (Success, Average Score, Question Count)
-        """
+    def score_assignment(self, reference_collection: str, assignment_pdf_path: str) -> Tuple[bool, float, int, List[dict]]:
         try:
-            # 1. Extract Text & Parse Q/A
+            # ... (extraction and parsing logic remains the same) ...
             text = self.pdf_processor.extract_text_from_pdf(assignment_pdf_path)
-            print(text)
             qa_pairs = self._parse_assignment_qa(text)
-            print(qa_pairs)
+            
             if not qa_pairs:
-                logger.warning("No Q&A format detected, falling back to simple text scoring")
-                # Fallback logic if needed, or return 0
-                return False, 0.0, 0
+                return False, 0.0, 0, []
 
             total_score = 0
+            graded_count = 0
+            breakdown_list = []  # <--- New list to store details
             
-            # 2. Score each Question individually
-            for item in qa_pairs:
+            for i, item in enumerate(qa_pairs):
                 question = item['question']
                 student_answer = item['answer']
                 
-                # A. Retrieve the "Correct Answer" context from DB
-                # We use the QUESTION to find the relevant part of the textbook
+                # ... (RAG retrieval logic remains the same) ...
                 results = self.vector_store.search(
                     collection_name=reference_collection,
                     query=question, 
-                    n_results=1 # Get the top matching paragraph
+                    n_results=3 
                 )
                 
-                if not results['documents']:
+                reference_context = ""
+                if results['documents'] and results['documents'][0]:
+                    reference_context = "\n---\n".join(results['documents'][0])
+                else:
                     continue
-                    
-                reference_context = results['documents'][0][0]
-                
-                # B. Ask Llama 3.2 to Grade it
-                score = self._ask_llm_to_grade(question, student_answer, reference_context)
-                total_score += score
 
-            # 3. Calculate Average
-            final_average = total_score / len(qa_pairs)
-            return True, round(final_average, 2), len(qa_pairs)
+                # CALL THE UPDATED GRADER
+                grade_result = self._ask_llm_to_grade(question, student_answer, reference_context)
+                
+                score = grade_result.get('score', 0)
+                feedback = grade_result.get('feedback', '')
+                
+                total_score += score
+                graded_count += 1
+                
+                # Add to breakdown list
+                breakdown_list.append({
+                    "question_number": i + 1,
+                    "score": score,
+                    "feedback": feedback
+                })
+
+            if graded_count == 0:
+                return False, 0.0, 0, []
+
+            final_average = total_score / graded_count
+            
+            # Return the list as the 4th item
+            return True, round(final_average, 2), graded_count, breakdown_list
 
         except Exception as e:
             logger.error(f"Scoring Error: {str(e)}")
-            return False, 0.0, 0
+            return False, 0.0, 0, []
 
-    def _ask_llm_to_grade(self, question: str, answer: str, context: str) -> int:
-        """Send prompt to Local LLM to get a 0-100 score"""
+    def _parse_assignment_qa(self, text: str) -> List[Dict]:
+        """
+        Robust Parser: Handles "1. Question ... Ans - Answer" format
+        even if lines are merged or formatting is messy.
+        """
+        qa_pairs = []
+
+        # CLEANUP: Fix common PDF merge issues before splitting
+        # Ensure there is a space after numbers (e.g. "1.What" -> "1. What")
+        text = re.sub(r'(\d+\.)([A-Za-z])', r'\1 \2', text)
+
+        # 1. Split by Question Numbers (1., 2., 3.)
+        # The lookahead (?=\d+\.) ensures we split BEFORE the number
+        fragments = re.split(r'(?=\d+\.\s)', text)
+        
+        for fragment in fragments:
+            fragment = fragment.strip()
+            # Skip empty or non-question chunks
+            if not fragment or not re.match(r'^\d+\.', fragment):
+                continue
+            
+            # 2. Split Question and Answer using "Ans" marker
+            # We look for "Ans -", "Ans-", or just "Ans" followed by text
+            parts = re.split(r'\s*Ans\s*[-–]?\s*', fragment, flags=re.IGNORECASE)
+            
+            if len(parts) >= 2:
+                # part[0] is "1. Question Text"
+                # part[1] is "Answer Text"
+                qa_pairs.append({
+                    "question": parts[0].strip(),
+                    "answer": parts[1].strip()
+                })
+            else:
+                # Fallback: If "Ans" missing, assume single line question or malformed
+                pass
+
+        # FALLBACK: If Regex found nothing (e.g. Essay format), use Paragraph Mode
+        if not qa_pairs:
+            logger.warning("Regex parsing failed. Using Paragraph Fallback.")
+            paragraphs = text.split('\n\n')
+            for p in paragraphs:
+                p = p.strip()
+                if len(p) > 30:
+                    # Treat first sentence as 'Question' query, rest as answer
+                    sentences = re.split(r'(?<=[.!?])\s+', p)
+                    if sentences:
+                        qa_pairs.append({
+                            "question": sentences[0],
+                            "answer": p
+                        })
+
+        return qa_pairs
+
+    def _ask_llm_to_grade(self, question: str, answer: str, context: str) -> dict:
+        print('Que : ',question)
+        print('Ans : ',answer)
+        """
+        Returns a dict: {'score': int, 'feedback': str}
+        """
         prompt = f"""
-        You are a strict teacher grading an exam.
-        
-        Reference Material: "{context}"
-        
+        You are a normal automated grader.
+
+        Reference Material (TRUTH):
+        "{context}"
+
         Exam Question: "{question}"
         Student Answer: "{answer}"
-        
-        Task: Grade the student's answer based ONLY on the Reference Material.
-        If the answer is correct according to the reference, give a high score.
-        If it contradicts the reference or is irrelevant, give a low score.
-        
-        OUTPUT FORMAT: Return ONLY a single integer from 0 to 100. Do not write any text.
+
+        INSTRUCTIONS:
+        1. Compare the Student Answer against the Reference Material.
+        2. Grade strictly from 0 to 100.
+        3. Provide a 1-sentence explanation for your score.
+
+        OUTPUT FORMAT:
+        Return a valid JSON object strictly like this:
+        {{
+            "score": <integer>,
+            "feedback": "<short explanation>"
+        }}
         """
         
         try:
@@ -175,114 +251,30 @@ class RAGService:
                 json={
                     "model": "llama3.2",
                     "prompt": prompt,
-                    "stream": False
-                }
+                    "stream": False,
+                    "format": "json"  # Force JSON mode
+                },
+                timeout=30 
             )
             
             if response.status_code == 200:
-                result_text = response.json()['response'].strip()
-                # Extract number from response (in case LLM is chatty)
-                import re
-                match = re.search(r'\d+', result_text)
-                if match:
-                    return int(match.group())
+                result = response.json()['response']
+                try:
+                    data = json.loads(result)
+                    # Print it to console so you can see it live!
+                    print(f"   >>> Graded: {data.get('score')} - {data.get('feedback')}")
+                    return data
+                except:
+                    # Fallback if LLM messes up JSON
+                    match = re.search(r'\d+', result)
+                    score = int(match.group()) if match else 0
+                    return {"score": score, "feedback": "Parsed from raw text"}
             
-            return 0 # Default to 0 on failure
+            return {"score": 0, "feedback": "API Error"}
             
         except Exception as e:
             logger.error(f"LLM Error: {e}")
-            return 0
-
-
-    def _parse_assignment_qa(self, text: str) -> List[Dict]:
-        """
-        Robust PDF Q&A parser with Fallback.
-        Strategy 1: Look for numbered questions (e.g., "1. What is...")
-        Strategy 2 (Fallback): If no numbers found, treat paragraphs as Q&A pairs.
-        """
-        
-        # --- CLEANUP PHASE ---
-        # Normalize PDF garbage
-        text = text.replace('\f', '\n')
-        text = re.sub(r'\n{2,}', '\n\n', text) # Normalize paragraph breaks
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-
-        qa_pairs = []
-        
-        # --- STRATEGY 1: STRICT NUMBERED PARSING ---
-        question_lines = []
-        answer_lines = []
-        in_question = False
-        
-        # Regex for "1.", "Q1", "1)", "(1)"
-        question_start = re.compile(r'^(?:Q(?:uestion)?\s*\d+|\(?\d+[\.\)])\s*')
-
-        for line in lines:
-            # New question detected
-            if question_start.match(line):
-                # Flush previous
-                if question_lines:
-                    qa_pairs.append({
-                        "question": " ".join(question_lines).strip(),
-                        "answer": " ".join(answer_lines).strip()
-                    })
-                
-                question_lines = []
-                answer_lines = []
-                in_question = True
-                
-                # Remove the number marker (e.g. "1. ") so we just get text
-                clean = question_start.sub('', line).strip()
-                question_lines.append(clean)
-                continue
-
-            if in_question:
-                # Simple heuristic: Answers usually start after the question line
-                # If the line looks like a sentence start, assume it's part of answer
-                if len(answer_lines) == 0 and not line.endswith('?'):
-                    in_question = False # Switch to answer mode
-                    
-                if in_question:
-                    question_lines.append(line)
-                else:
-                    answer_lines.append(line)
-            else:
-                # If we haven't found a question number yet, ignore or add to previous
-                if answer_lines:
-                    answer_lines.append(line)
-
-        # Flush the last block
-        if question_lines:
-            qa_pairs.append({
-                "question": " ".join(question_lines).strip(),
-                "answer": " ".join(answer_lines).strip()
-            })
-
-        # --- STRATEGY 2: FALLBACK (PARAGRAPH MODE) ---
-        # If Strategy 1 failed to find ANY questions, we use this.
-        if not qa_pairs:
-            logger.warning("Regex parsing failed. Switching to Paragraph Fallback mode.")
-            
-            # Split text by double newlines (paragraphs)
-            paragraphs = text.split('\n\n')
-            
-            for p in paragraphs:
-                p = p.strip()
-                if len(p) < 30: continue # Skip tiny garbage lines
-                
-                # Heuristic: Use the first sentence as the "Question" (Topic)
-                # and the whole paragraph as the "Answer".
-                # This allows the Vector DB to find the right context.
-                sentences = re.split(r'(?<=[.!?])\s+', p)
-                if sentences:
-                    topic_query = sentences[0]
-                    
-                    qa_pairs.append({
-                        "question": topic_query,  # We use this to search the DB
-                        "answer": p               # We grade the whole paragraph
-                    })
-
-        return qa_pairs
+            return {"score": 0, "feedback": str(e)}
 
 
     def _score_answer(self, reference_collection: str, question: str, answer: str) -> Dict:
