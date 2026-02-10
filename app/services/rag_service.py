@@ -106,10 +106,8 @@ class RAGService:
         
         return answer
     
-    def score_assignment(self, reference_collection: str, assignment_pdf_path: str) -> Tuple[bool, float, int, List[dict]]:
+    def score_assignment(self, reference_collection: str, text: str) -> Tuple[bool, float]:
         try:
-            # ... (extraction and parsing logic remains the same) ...
-            text = self.pdf_processor.extract_text_from_pdf(assignment_pdf_path)
             qa_pairs = self._parse_assignment_qa(text)
             
             if not qa_pairs:
@@ -139,9 +137,7 @@ class RAGService:
                 # CALL THE UPDATED GRADER
                 grade_result = self._ask_llm_to_grade(question, student_answer, reference_context)
                 
-                score = grade_result.get('score', 0)
-                feedback = grade_result.get('feedback', '')
-                
+                score = grade_result.get('score', 0)                
                 total_score += score
                 graded_count += 1
                 
@@ -149,7 +145,6 @@ class RAGService:
                 breakdown_list.append({
                     "question_number": i + 1,
                     "score": score,
-                    "feedback": feedback
                 })
 
             if graded_count == 0:
@@ -158,7 +153,7 @@ class RAGService:
             final_average = total_score / graded_count
             
             # Return the list as the 4th item
-            return True, round(final_average, 2), graded_count, breakdown_list
+            return True, round(final_average, 2)
 
         except Exception as e:
             logger.error(f"Scoring Error: {str(e)}")
@@ -166,60 +161,103 @@ class RAGService:
 
     def _parse_assignment_qa(self, text: str) -> List[Dict]:
         """
-        Robust Parser: Handles "1. Question ... Ans - Answer" format
-        even if lines are merged or formatting is messy.
+        Robustly extracts Question-Answer pairs from student text.
+        Handles:
+        - Structured: "Question 1: ... Answer: ..."
+        - Numbered: "1. ... Ans -"
+        - Implicit: "1. What is X? It is Y." (Splits by '?')
         """
         qa_pairs = []
 
-        # CLEANUP: Fix common PDF merge issues before splitting
-        # Ensure there is a space after numbers (e.g. "1.What" -> "1. What")
-        text = re.sub(r'(\d+\.)([A-Za-z])', r'\1 \2', text)
+        # 1. CLEANUP HEADERS (Skip student metadata)
+        # Looks for the first occurrence of "1." or "Question 1" to chop off "Student Name" headers
+        match_start = re.search(r'(?:Question|Q|Section)\s*1\s*[:\.\)\-]|(?<=^)\s*1\.|(?<=\n)\s*1\.', text, re.IGNORECASE)
+        if match_start:
+            text = text[match_start.start():]
 
-        # 1. Split by Question Numbers (1., 2., 3.)
-        # The lookahead (?=\d+\.) ensures we split BEFORE the number
-        fragments = re.split(r'(?=\d+\.\s)', text)
-        
+        # 2. NORMALIZE QUESTION START MARKERS
+        # We inject a special separator (__SPLIT_Q__) before every new question number.
+        # Handles: "Question 1:", "Q.1", "1.", "(1)"
+        text = re.sub(
+            r'(?i)([\.\?!]\s*|\n|^)(?:Question\s*\d+|Q\.?\s*\d+|Section\s*\d+|\d+)\s*[:\.\)\-]', 
+            r'\1\n__SPLIT_Q__', 
+            text
+        )
+
+        # 3. SPLIT INTO CHUNKS (Each chunk = 1 Question + Answer)
+        fragments = text.split('__SPLIT_Q__')
+
         for fragment in fragments:
             fragment = fragment.strip()
-            # Skip empty or non-question chunks
-            if not fragment or not re.match(r'^\d+\.', fragment):
+            if not fragment:
                 continue
-            
-            # 2. Split Question and Answer using "Ans" marker
-            # We look for "Ans -", "Ans-", or just "Ans" followed by text
-            parts = re.split(r'\s*Ans\s*[-–]?\s*', fragment, flags=re.IGNORECASE)
-            
-            if len(parts) >= 2:
-                # part[0] is "1. Question Text"
-                # part[1] is "Answer Text"
-                qa_pairs.append({
-                    "question": parts[0].strip(),
-                    "answer": parts[1].strip()
-                })
-            else:
-                # Fallback: If "Ans" missing, assume single line question or malformed
-                pass
 
-        # FALLBACK: If Regex found nothing (e.g. Essay format), use Paragraph Mode
-        if not qa_pairs:
-            logger.warning("Regex parsing failed. Using Paragraph Fallback.")
-            paragraphs = text.split('\n\n')
-            for p in paragraphs:
-                p = p.strip()
-                if len(p) > 30:
-                    # Treat first sentence as 'Question' query, rest as answer
-                    sentences = re.split(r'(?<=[.!?])\s+', p)
-                    if sentences:
-                        qa_pairs.append({
-                            "question": sentences[0],
-                            "answer": p
-                        })
+            # 4. SPLIT QUESTION VS ANSWER
+            
+            # Strategy A: Explicit "Answer" Marker
+            # Looks for "Ans:", "Answer -", "Solution:", "A."
+            # Using a capture group '()' around the separator to split exactly once
+            parts = re.split(
+                r'(?i)(?:\n|\s)(?:Ans|Answer|A|Sol|Solution)\s*[:\-\–\.]', 
+                fragment, 
+                maxsplit=1
+            )
+
+            question_text = ""
+            answer_text = ""
+
+            if len(parts) > 1:
+                # Case A: Found an explicit "Answer:" marker
+                question_text = parts[0].strip()
+                answer_text = parts[1].strip()
+            
+            else:
+                # Strategy B: Implicit Split (No "Answer:" keyword)
+                # We must guess where the question ends.
+                
+                # Sub-Strategy B1: Split by the first Question Mark (?)
+                # Only if '?' appears in the first 300 characters (assumes questions aren't massive)
+                q_match = re.search(r'\?', fragment)
+                if q_match and q_match.start() < 300:
+                    question_text = fragment[:q_match.end()].strip()
+                    answer_text = fragment[q_match.end():].strip()
+                
+                else:
+                    # Sub-Strategy B2: Split by First Sentence/Newline
+                    # If no '?', assume the first line (or sentence) is the question.
+                    # Look for the first newline OR the first period followed by a space
+                    split_match = re.search(r'(?:\n|\.\s)', fragment)
+                    if split_match:
+                        question_text = fragment[:split_match.start() + 1].strip()
+                        answer_text = fragment[split_match.end():].strip()
+                    else:
+                        # Fallback: Treat whole thing as a question (or invalid)
+                        question_text = fragment
+                        answer_text = ""
+
+            # 5. FINAL CLEANUP OF QUESTION TEXT
+            # Remove the leading "Question 1:" or "1." from the extracted question text
+            # so the LLM gets just "What is AI?" instead of "1. What is AI?"
+            question_text = re.sub(
+                r'^(?:Question\s*\d+|Q\.?\s*\d+|Section\s*\d+|\d+)\s*[:\.\)\-]\s*', 
+                '', 
+                question_text, 
+                flags=re.IGNORECASE
+            )
+
+            if question_text:
+                qa_pairs.append({
+                    "question": question_text,
+                    "answer": answer_text or "Student provided an unstructured answer."
+                })
+
+            
+            logger.debug(f"Q: {question_text} | A: {answer_text}")
+
 
         return qa_pairs
 
     def _ask_llm_to_grade(self, question: str, answer: str, context: str) -> dict:
-        print('Que : ',question)
-        print('Ans : ',answer)
         """
         Returns a dict: {'score': int, 'feedback': str}
         """
@@ -241,7 +279,6 @@ class RAGService:
         Return a valid JSON object strictly like this:
         {{
             "score": <integer>,
-            "feedback": "<short explanation>"
         }}
         """
         
@@ -262,13 +299,12 @@ class RAGService:
                 try:
                     data = json.loads(result)
                     # Print it to console so you can see it live!
-                    print(f"   >>> Graded: {data.get('score')} - {data.get('feedback')}")
                     return data
                 except:
                     # Fallback if LLM messes up JSON
                     match = re.search(r'\d+', result)
                     score = int(match.group()) if match else 0
-                    return {"score": score, "feedback": "Parsed from raw text"}
+                    return {"score": score}
             
             return {"score": 0, "feedback": "API Error"}
             

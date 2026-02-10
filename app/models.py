@@ -33,14 +33,12 @@ class ScoreRequest(BaseModel):
 class QuestionGrade(BaseModel):
     question_number: int
     score: int
-    feedback: Optional[str] = None
-    
+    feedback: Optional[str] = None  # Handle cases where feedback might be empty
+
 class ScoreResponse(BaseModel):
     success: bool
-    score: float  # Just the number (0-100)
-    total_questions: int
-    breakdown: List[QuestionGrade]
-
+    score: float
+    
 class DifficultyLevel(str, Enum):
     easy = "easy"
     moderate = "moderate"

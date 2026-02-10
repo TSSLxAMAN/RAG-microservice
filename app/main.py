@@ -137,55 +137,36 @@ async def question_endpoint(request: QuestionRequest):
 
 
 @app.post("/api/score", response_model=ScoreResponse)
-async def score_endpoint(
+def score_endpoint(
     collection_name: str = Form(...),
-    file: UploadFile = File(...)
+    extracted_text: str = Form(...)
 ):
     """
     Score an assignment PDF against a trained reference model
-    
-    - **collection_name**: Name of the trained reference collection
-    - **file**: Assignment PDF to score
     """
     try:
-        # Validate file type
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
         
-        # Save uploaded assignment file
-        assignment_path = os.path.join(
-            PDF_UPLOAD_PATH, 
-            f"assignment_{file.filename}"
-        )
-        
-        with open(assignment_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        logger.info(f"Saved assignment to: {assignment_path}")
-        
-        # Score the assignment
-        success, score, total_questions, breakdown = rag_service.score_assignment(
+        success, score = rag_service.score_assignment(
             reference_collection=collection_name,
-            assignment_pdf_path=assignment_path
+            text=extracted_text
         )
         
+        # Handle Failure (e.g., OCR failed, no questions found)
         if not success:
             return ScoreResponse(
-                    success=False,
-                    score=0.0,
-                    total_questions=0,
-                    breakdown=[]
-                )
+                success=False,
+                score=0.0,
+            )
         
+        # Handle Success
         return ScoreResponse(
             success=True,
             score=score,
-            total_questions=total_questions,
-            breakdown=breakdown
-        )
+           )
         
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error in score_endpoint: {str(e)}")
+        # Return a clean 500 error that Django can log
         raise HTTPException(status_code=500, detail=str(e))
 
 
